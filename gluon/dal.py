@@ -879,6 +879,79 @@ class BaseAdapter(ConnectionPool):
     def varquote(self,name):
         return name
 
+    def create_reference(self, table, field, referenced, TFK):
+        db = table._db
+        sql_fields = {}
+        sql_fields_aux = {}
+        tablename = table._tablename
+        types = self.types
+        field_name = field.name
+        field_type = field.type
+        constraint_name = self.constraint_name(tablename, field_name)
+
+        try:
+            rtable = db[referenced]
+            rfield = rtable._id
+            rfieldname = rfield.name
+            rtablename = referenced
+        except (KeyError, ValueError, AttributeError), e:
+            LOGGER.debug('Error: %s' % e)
+            try:
+                rtablename,rfieldname = referenced.split('.')
+                rtable = db[rtablename]
+                rfield = rtable[rfieldname]
+            except Exception, e:
+                LOGGER.debug('Error: %s' %e)
+                raise KeyError('Cannot resolve reference %s in %s definition' % (referenced, table._tablename))
+
+        # must be PK reference or unique
+        if getattr(rtable, '_primarykey', None) and rfieldname in rtable._primarykey or \
+                rfield.unique:
+            ftype = types[rfield.type[:9]] % \
+                dict(length=rfield.length)
+            # multicolumn primary key reference?
+            if not rfield.unique and len(rtable._primarykey)>1:
+                # then it has to be a table level FK
+                if rtablename not in TFK:
+                    TFK[rtablename] = {}
+                TFK[rtablename][rfieldname] = field_name
+            else:
+                ftype = ftype + \
+                    types['reference FK'] % dict(
+                        constraint_name = constraint_name, # should be quoted
+                        foreign_key = rtable.sqlsafe + ' (' + rfield.sqlsafe_name + ')',
+                        table_name = table.sqlsafe,
+                        field_name = field.sqlsafe_name,
+                        on_delete_action=field.ondelete)
+        else:
+            # make a guess here for circular references
+            if referenced in db:
+                id_fieldname = db[referenced]._id.sqlsafe_name
+            elif referenced == tablename:
+                id_fieldname = table._id.sqlsafe_name
+            else: #make a guess
+                id_fieldname = self.QUOTE_TEMPLATE % 'id'
+            #gotcha: the referenced table must be defined before
+            #the referencing one to be able to create the table
+            #Also if it's not recommended, we can still support
+            #references to tablenames without rname to make
+            #migrations and model relationship work also if tables
+            #are not defined in order
+            if referenced == tablename:
+                real_referenced = db[referenced].sqlsafe
+            else:
+                real_referenced = (referenced in db
+                               and db[referenced].sqlsafe
+                               or referenced)
+            rfield = db[referenced]._id
+            ftype = types[field_type[:9]] % dict(
+                index_name = self.QUOTE_TEMPLATE % (field_name+'__idx'),
+                field_name = field.sqlsafe_name,
+                constraint_name = self.QUOTE_TEMPLATE % constraint_name,
+                foreign_key = '%s (%s)' % (real_referenced, rfield.sqlsafe_name),
+                on_delete_action=field.ondelete)
+        return ftype
+
     def create_table(self, table,
                      migrate=True,
                      fake_migrate=False,
@@ -893,6 +966,8 @@ class BaseAdapter(ConnectionPool):
         tablename = table._tablename
         sortable = 0
         types = self.types
+        db._pending_fk[tablename] = []
+
         for field in table:
             sortable += 1
             field_name = field.name
@@ -900,76 +975,26 @@ class BaseAdapter(ConnectionPool):
             if isinstance(field_type,SQLCustomType):
                 ftype = field_type.native or field_type.type
             elif field_type.startswith('reference'):
-                referenced = field_type[10:].strip()
-                if referenced == '.':
-                    referenced = tablename
-                constraint_name = self.constraint_name(tablename, field_name)
                 # if not '.' in referenced \
                 #         and referenced != tablename \
                 #         and hasattr(table,'_primarykey'):
                 #     ftype = types['integer']
                 #else:
-                try:
-                    rtable = db[referenced]
-                    rfield = rtable._id
-                    rfieldname = rfield.name
-                    rtablename = referenced
-                except (KeyError, ValueError, AttributeError), e:
-                    LOGGER.debug('Error: %s' % e)
-                    try:
-                        rtablename,rfieldname = referenced.split('.')
-                        rtable = db[rtablename]
-                        rfield = rtable[rfieldname]
-                    except Exception, e:
-                        LOGGER.debug('Error: %s' %e)
-                        raise KeyError('Cannot resolve reference %s in %s definition' % (referenced, table._tablename))
 
-                # must be PK reference or unique
-                if getattr(rtable, '_primarykey', None) and rfieldname in rtable._primarykey or \
-                        rfield.unique:
-                    ftype = types[rfield.type[:9]] % \
-                        dict(length=rfield.length)
-                    # multicolumn primary key reference?
-                    if not rfield.unique and len(rtable._primarykey)>1:
-                        # then it has to be a table level FK
-                        if rtablename not in TFK:
-                            TFK[rtablename] = {}
-                        TFK[rtablename][rfieldname] = field_name
-                    else:
-                        ftype = ftype + \
-                            types['reference FK'] % dict(
-                                constraint_name = constraint_name, # should be quoted
-                                foreign_key = rtable.sqlsafe + ' (' + rfield.sqlsafe_name + ')',
-                                table_name = table.sqlsafe,
-                                field_name = field.sqlsafe_name,
-                                on_delete_action=field.ondelete)
+                # <lazy_references>
+                referenced = field_type[10:].strip()
+                if referenced == '.':
+                    referenced = tablename
+
+                if db._lazy_references:
+                    ftype = self.types["integer"]
+                    db._pending_fk[tablename].append(
+                        {"field": field, "referenced": referenced})
                 else:
-                    # make a guess here for circular references
-                    if referenced in db:
-                        id_fieldname = db[referenced]._id.sqlsafe_name
-                    elif referenced == tablename:
-                        id_fieldname = table._id.sqlsafe_name
-                    else: #make a guess
-                        id_fieldname = self.QUOTE_TEMPLATE % 'id'
-                    #gotcha: the referenced table must be defined before
-                    #the referencing one to be able to create the table
-                    #Also if it's not recommended, we can still support
-                    #references to tablenames without rname to make
-                    #migrations and model relationship work also if tables
-                    #are not defined in order
-                    if referenced == tablename:
-                        real_referenced = db[referenced].sqlsafe
-                    else:
-                        real_referenced = (referenced in db
-                                           and db[referenced].sqlsafe
-                                           or referenced)
-                    rfield = db[referenced]._id
-                    ftype = types[field_type[:9]] % dict(
-                        index_name = self.QUOTE_TEMPLATE % (field_name+'__idx'),
-                        field_name = field.sqlsafe_name,
-                        constraint_name = self.QUOTE_TEMPLATE % constraint_name,
-                        foreign_key = '%s (%s)' % (real_referenced, rfield.sqlsafe_name),
-                        on_delete_action=field.ondelete)
+                    ftype = self.create_reference(table, field, referenced, TFK)
+
+                # <lazy_references>
+
             elif field_type.startswith('list:reference'):
                 ftype = types[field_type[:14]]
             elif field_type.startswith('decimal'):
@@ -1053,17 +1078,26 @@ class BaseAdapter(ConnectionPool):
             other = ' ENGINE=%s CHARACTER SET utf8;' % engine
 
         fields = ',\n    '.join(fields)
+
+        # <lazy_references>
+        if len(TFK) > 0:
+            db._pending_tfk[tablename] = []
         for rtablename in TFK:
             rfields = TFK[rtablename]
             pkeys = [self.QUOTE_TEMPLATE % pk for pk in db[rtablename]._primarykey]
             fkeys = [self.QUOTE_TEMPLATE % rfields[k].name for k in pkeys ]
-            fields = fields + ',\n    ' + \
-                types['reference TFK'] % dict(
-                table_name = table.sqlsafe,
-                field_name=', '.join(fkeys),
-                foreign_table = table.sqlsafe,
-                foreign_key = ', '.join(pkeys),
-                on_delete_action = field.ondelete)
+            tfk_data = dict(table_name = table.sqlsafe,
+                            field_name=', '.join(fkeys),
+                            foreign_table = table.sqlsafe,
+                            foreign_key = ', '.join(pkeys),
+                            on_delete_action = field.ondelete)
+
+            if db._lazy_references:
+                db._pending_tfk[tablename].append({"table": rtablename, "data": tfk_data})
+            else:
+                fields = fields + ',\n    ' + \
+                    types['reference TFK'] % tfk_data
+        # <lazy_references>
 
         table_rname = table.sqlsafe
 
@@ -7726,7 +7760,7 @@ class DAL(object):
                  bigint_id=False, debug=False, lazy_tables=False,
                  db_uid=None, do_connect=True,
                  after_connection=None, tables=None, ignore_field_case=True,
-                 entity_quoting=False):
+                 entity_quoting=False, lazy_references=True):
         """
         Creates a new Database Abstraction Layer instance.
 
@@ -7780,6 +7814,7 @@ class DAL(object):
                  databases folder
         :bigint_id (defaults to False): If set, turn on bigint instead of int for id fields
         :lazy_tables (defaults to False): delay table definition until table access
+        :lazy_references (defaults to True): <INCOMPLETE>
         :after_connection (defaults to None): a callable that will be execute after the connection
         """
         if uri == '<zombie>' and db_uid is not None: return
@@ -7796,6 +7831,9 @@ class DAL(object):
         self._lastsql = ''
         self._timings = []
         self._pending_references = {}
+        # <lazy_references>
+        self._pending_tfk = {}
+        self._pending_fk = {}
         self._request_tenant = 'request_tenant'
         self._common_fields = []
         self._referee_name = '%(table)s'
@@ -7804,6 +7842,7 @@ class DAL(object):
         self._migrated = []
         self._LAZY_TABLES = {}
         self._lazy_tables = lazy_tables
+        self._lazy_references = lazy_references
         self._tables = SQLCallableList()
         self._driver_args = driver_args
         self._adapter_args = adapter_args
