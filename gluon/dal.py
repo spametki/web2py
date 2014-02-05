@@ -879,7 +879,8 @@ class BaseAdapter(ConnectionPool):
     def varquote(self,name):
         return name
 
-    def create_reference(self, table, field, referenced, TFK):
+    # <lazy_references>
+    def create_reference(self, table, field, referenced, TFK, update=False):
         db = table._db
         sql_fields = {}
         sql_fields_aux = {}
@@ -944,13 +945,23 @@ class BaseAdapter(ConnectionPool):
                                and db[referenced].sqlsafe
                                or referenced)
             rfield = db[referenced]._id
-            ftype = types[field_type[:9]] % dict(
-                index_name = self.QUOTE_TEMPLATE % (field_name+'__idx'),
-                field_name = field.sqlsafe_name,
-                constraint_name = self.QUOTE_TEMPLATE % constraint_name,
-                foreign_key = '%s (%s)' % (real_referenced, rfield.sqlsafe_name),
-                on_delete_action=field.ondelete)
+            if update:
+                ftype = types['reference FK'] % dict(
+                    constraint_name = constraint_name, # should be quoted
+                    foreign_key = rtable.sqlsafe + ' (' + rfield.sqlsafe_name + ')',
+                    table_name = table.sqlsafe,
+                    field_name = field.sqlsafe_name,
+                    on_delete_action=field.ondelete)
+            else:
+                ftype = types[field_type[:9]] % dict(
+                    index_name = self.QUOTE_TEMPLATE % (field_name+'__idx'),
+                    field_name = field.sqlsafe_name,
+                    constraint_name = self.QUOTE_TEMPLATE % constraint_name,
+                    foreign_key = '%s (%s)' % (real_referenced, rfield.sqlsafe_name),
+                    on_delete_action=field.ondelete)
         return ftype
+    # </lazy_references>
+
 
     def create_table(self, table,
                      migrate=True,
@@ -966,7 +977,10 @@ class BaseAdapter(ConnectionPool):
         tablename = table._tablename
         sortable = 0
         types = self.types
+
+        # <lazy_references>
         db._pending_fk[tablename] = []
+        # </lazy_references>
 
         for field in table:
             sortable += 1
@@ -992,8 +1006,7 @@ class BaseAdapter(ConnectionPool):
                         {"field": field, "referenced": referenced})
                 else:
                     ftype = self.create_reference(table, field, referenced, TFK)
-
-                # <lazy_references>
+                # </lazy_references>
 
             elif field_type.startswith('list:reference'):
                 ftype = types[field_type[:14]]
@@ -7202,7 +7215,8 @@ ADAPTERS = {
     'imap': IMAPAdapter
 }
 
-def sqlhtml_validators(field):
+
+def sqlhtml_validators(field, skip_references=False):
     """
     Field type validation, using web2py's validators mechanism.
 
@@ -7251,6 +7265,10 @@ def sqlhtml_validators(field):
         requires.append(validators.IS_TIME())
     elif field_type == 'datetime':
         requires.append(validators.IS_DATETIME())
+    # <lazy_references>
+    elif db and field_type.startswith('reference') and skip_references:
+        return DEFAULT
+    # </lazy_references>
     elif db and field_type.startswith('reference') and \
             field_type.find('.') < 0 and \
             field_type[10:] in db.tables:
@@ -7760,7 +7778,7 @@ class DAL(object):
                  bigint_id=False, debug=False, lazy_tables=False,
                  db_uid=None, do_connect=True,
                  after_connection=None, tables=None, ignore_field_case=True,
-                 entity_quoting=False, lazy_references=True):
+                 entity_quoting=False, lazy_references=False):
         """
         Creates a new Database Abstraction Layer instance.
 
@@ -7814,7 +7832,7 @@ class DAL(object):
                  databases folder
         :bigint_id (defaults to False): If set, turn on bigint instead of int for id fields
         :lazy_tables (defaults to False): delay table definition until table access
-        :lazy_references (defaults to True): <INCOMPLETE>
+        :lazy_references (defaults to False): EXPERIMENTAL (only tested with PostgreSQL 9.1)
         :after_connection (defaults to None): a callable that will be execute after the connection
         """
         if uri == '<zombie>' and db_uid is not None: return
@@ -7831,9 +7849,6 @@ class DAL(object):
         self._lastsql = ''
         self._timings = []
         self._pending_references = {}
-        # <lazy_references>
-        self._pending_tfk = {}
-        self._pending_fk = {}
         self._request_tenant = 'request_tenant'
         self._common_fields = []
         self._referee_name = '%(table)s'
@@ -7842,7 +7857,11 @@ class DAL(object):
         self._migrated = []
         self._LAZY_TABLES = {}
         self._lazy_tables = lazy_tables
+        # <lazy_references>
         self._lazy_references = lazy_references
+        self._pending_tfk = {}
+        self._pending_fk = {}
+        # </lazy_references>
         self._tables = SQLCallableList()
         self._driver_args = driver_args
         self._adapter_args = adapter_args
@@ -8277,7 +8296,7 @@ def index():
         table._create_references()
         for field in table:
             if field.requires == DEFAULT:
-                field.requires = sqlhtml_validators(field)
+                field.requires = sqlhtml_validators(field, skip_references=self._lazy_references) # <lazy_references></lazy_references>
 
         migrate = self._migrate_enabled and args_get('migrate',self._migrate)
         if migrate and not self._uri in (None,'None') \
@@ -8298,6 +8317,62 @@ def index():
         on_define = args_get('on_define',None)
         if on_define: on_define(table)
         return table
+
+    # <lazy_references>
+    def update_references(self):
+        """To be called at the end of model execution
+        (needs setting DAL(..., lazy_references=True))
+        Experimental: only tested with PostgreSQL 9.1
+
+        # TODO:
+        # - check for constraints before writing to db
+        # - consistent engine reference parameters
+        #   (same reference key names)
+        # - method naming conventions/collision
+        #    update_reference
+        #    create_reference
+        # - support table foreign keys
+        # - log sql
+        # - handle fixing migrations (fake_migrate)
+        # - support per-adapter fk update formats
+        #     (self._adapter.types["update fk/tfk"])
+        #   NOTE: this could break custom adapters
+        #   so there should be a default fallback
+        """
+
+        add_validators = []
+
+        if not self._lazy_references:
+            LOGGER.warning("DAL.update_reference: (lazy_references is disabled)")
+            return
+
+        for table in self:
+            for field in table:
+                if field.type.startswith("reference "):
+                    if field.requires == DEFAULT:
+                        add_validators.append(field)
+                    if self._migrate:
+                        referenced = field.type[10:].strip()
+                        if referenced == '.':
+                            referenced = table._tablename
+                        sql = "ALTER TABLE %s ADD " % table.sqlsafe
+                        ftype = self._adapter.create_reference(table, field, referenced, {}, True)
+                        if ftype.startswith(", "):
+                            ftype = ftype[2:]
+                        sql += ftype
+                        try:
+                            self.executesql(sql)
+                        except Exception, e:
+                            # (psycopg2 throws InternalError)
+                            # TODO: catch any driver key error
+                            LOGGER.warning("Skipped constraint (found previous key for %s.%s)" % (table._tablename, field.name))
+
+        # required for applying constraint updates
+        self.commit()
+        
+        for field in add_validators:
+            field.requires = sqlhtml_validators(field)
+    # </lazy_references>
 
     def as_dict(self, flat=False, sanitize=True):
         db_uid = uri = None
